@@ -1,0 +1,8 @@
+[Applet Factory]
+Id=BatteryPercentFactory
+Location=/usr/lib/mate-panel/battery-percent
+
+[BatteryPercent]
+Name=Battery Percent
+Description=Display battery charge level as a percentage in the panel
+Icon=battery

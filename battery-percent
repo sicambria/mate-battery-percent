@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+
+import os
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+gi.require_version('MatePanelApplet', '4.0')
+
+from gi.repository import Gtk, Gdk, GLib, MatePanelApplet
+
+
+POWER_SUPPLY_DIR = '/sys/class/power_supply'
+UPDATE_INTERVAL = 5
+
+
+def find_battery():
+    try:
+        for name in os.listdir(POWER_SUPPLY_DIR):
+            type_path = os.path.join(POWER_SUPPLY_DIR, name, 'type')
+            present_path = os.path.join(POWER_SUPPLY_DIR, name, 'present')
+            try:
+                with open(type_path) as f:
+                    if f.read().strip() != 'Battery':
+                        continue
+                with open(present_path) as f:
+                    if f.read().strip() != '1':
+                        continue
+                return name
+            except (OSError, IOError):
+                continue
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def read_battery(bat_name):
+    if bat_name is None:
+        return (None, None)
+    base = os.path.join(POWER_SUPPLY_DIR, bat_name)
+    try:
+        with open(os.path.join(base, 'capacity')) as f:
+            pct = int(f.read().strip())
+        with open(os.path.join(base, 'status')) as f:
+            status = f.read().strip()
+        return (pct, status)
+    except (OSError, IOError, ValueError):
+        return (None, None)
+
+
+def icon_name(pct, status):
+    if pct is None:
+        return 'battery-missing'
+    charging = (status in ('Charging', 'Full'))
+    if charging:
+        if pct >= 90: return 'battery-full-charging'
+        if pct >= 30: return 'battery-good-charging'
+        if pct >= 10: return 'battery-low-charging'
+        return 'battery-caution-charging'
+    else:
+        if pct >= 90: return 'battery-full'
+        if pct >= 30: return 'battery-good'
+        if pct >= 10: return 'battery-low'
+        return 'battery-caution'
+
+
+NO_BAT_ICON = None
+
+
+def icon_name_safe(pct, status):
+    global NO_BAT_ICON
+    name = icon_name(pct, status)
+    if NO_BAT_ICON is None:
+        NO_BAT_ICON = Gtk.IconTheme.get_default().has_icon('battery-missing')
+    if name == 'battery-missing' and not NO_BAT_ICON:
+        return 'battery'
+    return name
+
+
+class BatteryApplet:
+    def __init__(self, applet):
+        self.applet = applet
+        self.battery = find_battery()
+        self.timeout_id = None
+
+        orient = applet.get_orient()
+        box_orient = (Gtk.Orientation.VERTICAL
+                      if orient in (MatePanelApplet.AppletOrient.LEFT,
+                                    MatePanelApplet.AppletOrient.RIGHT)
+                      else Gtk.Orientation.HORIZONTAL)
+
+        self.box = Gtk.Box(orientation=box_orient, spacing=2)
+        applet.add(self.box)
+
+        self.icon = Gtk.Image()
+        self.box.pack_start(self.icon, False, False, 0)
+
+        self.label = Gtk.Label()
+        css = b"#battery-label { font-size: 150%; }"
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        self.label.set_name('battery-label')
+        self.label.get_style_context().add_provider(
+            provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.box.pack_start(self.label, False, False, 0)
+
+        applet.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        applet.connect('button-press-event', self.on_button_press)
+        applet.connect('change-orient', self.on_orient_change)
+        applet.connect('destroy', self.on_destroy)
+
+        applet.show_all()
+
+        self.timeout_id = GLib.timeout_add_seconds(UPDATE_INTERVAL, self.update)
+        self.update()
+
+    def update(self):
+        pct, status = read_battery(self.battery)
+        self.icon.set_from_icon_name(
+            icon_name_safe(pct, status), Gtk.IconSize.MENU)
+
+        if pct is not None:
+            self.label.set_text(f'{pct}%')
+            self.applet.set_tooltip_text(f'Battery: {pct}% ({status})')
+        else:
+            self.label.set_text('N/A')
+            self.applet.set_tooltip_text('No battery detected')
+
+        if self.battery is None:
+            self.battery = find_battery()
+        else:
+            present_path = os.path.join(
+                POWER_SUPPLY_DIR, self.battery, 'present')
+            try:
+                with open(present_path) as f:
+                    if f.read().strip() != '1':
+                        self.battery = None
+            except (OSError, IOError):
+                self.battery = None
+
+        return True
+
+    def on_button_press(self, widget, event):
+        if event.button == 3:
+            self.show_menu(event)
+            return True
+        if event.button == 1:
+            os.system('mate-power-statistics &')
+            return True
+        return False
+
+    def on_orient_change(self, applet, orient, _data=None):
+        self.box.set_orientation(
+            Gtk.Orientation.VERTICAL
+            if orient in (MatePanelApplet.AppletOrient.LEFT,
+                          MatePanelApplet.AppletOrient.RIGHT)
+            else Gtk.Orientation.HORIZONTAL)
+
+    def on_destroy(self, widget):
+        if self.timeout_id:
+            GLib.source_remove(self.timeout_id)
+            self.timeout_id = None
+
+    def show_menu(self, event):
+        pct, status = read_battery(self.battery)
+        menu = Gtk.Menu()
+
+        if pct is not None:
+            item = Gtk.MenuItem(label=f'Battery: {pct}% ({status})')
+            item.set_sensitive(False)
+            menu.append(item)
+            menu.append(Gtk.SeparatorMenuItem())
+
+        power = Gtk.MenuItem(label='Power Statistics')
+        power.connect('activate', lambda w: os.system('mate-power-statistics &'))
+        menu.append(power)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        quit_item = Gtk.MenuItem(label='Remove from Panel')
+        quit_item.connect('activate', lambda w: Gtk.main_quit())
+        menu.append(quit_item)
+
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+
+def applet_fill(applet, iid, data):
+    BatteryApplet(applet)
+    return True
+
+
+if __name__ == '__main__':
+    MatePanelApplet.Applet.factory_main(
+        'BatteryPercentFactory',
+        True,
+        MatePanelApplet.Applet.__gtype__,
+        applet_fill,
+        None,
+    )
